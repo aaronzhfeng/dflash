@@ -83,9 +83,18 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        attn_impl = None
+        if hasattr(self.config, "dflash_config") and isinstance(self.config.dflash_config, dict):
+            attn_impl = self.config.dflash_config.get("attn_implementation")
+        if not attn_impl:
+            attn_impl = getattr(self.config, "_attn_implementation", "eager")
+
         attn_fn: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        if attn_impl == "tpu":
+            from .backends.tpu import tpu_attention_forward
+            attn_fn = tpu_attention_forward
+        elif attn_impl != "eager":
+            attn_fn = ALL_ATTENTION_FUNCTIONS[attn_impl]
         attn_output, attn_weights = attn_fn(
             self,
             q,
@@ -188,7 +197,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             )
         return self.norm(hidden_states)
     
-    @torch.inference_mode()
+    @torch.no_grad()
     def spec_generate(
         self,
         target: nn.Module,
@@ -198,6 +207,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         stop_token_ids: list[int],
         temperature: float,
     ):
+        # XLA graph-break helper: compiles and executes the traced graph so far.
+        # On GPU this is a no-op. On TPU it prevents XLA from trying to compile
+        # the entire while-loop as one monolithic graph, which would take hours.
+        try:
+            import torch_xla.core.xla_model as xm
+            _sync = xm.mark_step
+        except ImportError:
+            _sync = lambda: None
+
         self.eval() 
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
@@ -223,10 +241,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             logits_to_keep=1,
             output_hidden_states=True,
         )
+        _sync()  # Compile & execute prefill graph
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
         target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
+        _sync()  # Materialize prefill outputs before decode loop
 
         # Decode stage
         acceptance_lengths = []
@@ -245,6 +265,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             )[:, -block_size+1:, :])
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
+            _sync()  # Compile & execute draft graph
 
             output = target(
                 block_output_ids,
@@ -253,8 +274,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 use_cache=True,
                 output_hidden_states=True,
             )
+            _sync()  # Compile & execute target verify graph
 
             posterior = sample(output.logits, temperature)
+            _sync()  # Materialize tensors before .item() forces sync
             acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
@@ -262,6 +285,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             past_key_values_target.crop(start)
             target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[:, :acceptance_length + 1, :]
             acceptance_lengths.append(acceptance_length+1)
+            _sync()  # Clean graph boundary before next iteration
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
             ):
